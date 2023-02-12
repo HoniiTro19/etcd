@@ -89,6 +89,36 @@ tests_build() {
   BINDIR="${out}" run ./tests/functional/build.sh || return 2
 }
 
+raftexample_build() {
+  out="bin/contrib"
+  if [[ -n "${BINDIR}" ]]; then out="${BINDIR}"; fi
+  run rm -f "${out}/raftexample"
+  (
+    cd ./contrib/raftexample
+    # shellcheck disable=SC2086
+    run env "${GO_BUILD_ENV[@]}" go build $GO_BUILD_FLAGS \
+      -trimpath \
+      -installsuffix=cgo \
+      "-ldflags=${GO_LDFLAGS[*]}" \
+      -o="../../${out}/raftexample" . || return 2
+  ) || return 2
+}
+
+election_build() {
+  out="bin/contrib"
+  if [[ -n "${BINDIR}" ]]; then out="${BINDIR}"; fi
+  run rm -f "${out}/election"
+  (
+    cd ./contrib/election
+    # shellcheck disable=SC2086
+    run env "${GO_BUILD_ENV[@]}" go build $GO_BUILD_FLAGS \
+      -trimpath \
+      -installsuffix=cgo \
+      "-ldflags=${GO_LDFLAGS[*]}" \
+      -o="../../${out}/election" . || return 2
+  ) || return 2
+}
+
 run_build() {
   echo Running "$1"
   if $1; then
