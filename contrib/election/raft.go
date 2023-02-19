@@ -42,6 +42,7 @@ type Args struct {
 	latency   int
 	inQueueC  chan<- raftpb.Message
 	outQueueC <-chan []raftpb.Message
+	leadkill  bool
 }
 
 // A usage example of raft instance(raft.Node) without proposals, reads or confchanges from outside.
@@ -53,6 +54,7 @@ type raftNode struct {
 	wal         *wal.WAL
 	snapdir     string
 	snapshotter *snap.Snapshotter
+	leadkill    bool
 
 	confState     raftpb.ConfState
 	snapshotIndex uint64
@@ -87,6 +89,7 @@ func newRaftNode(args *Args, logger *zap.Logger) chan struct{} {
 		latency:   args.latency,
 		waldir:    fmt.Sprintf("election-%d", args.id),
 		snapdir:   fmt.Sprintf("election-%d-snap", args.id),
+		leadkill:  args.leadkill,
 		stopdonec: stopdonec,
 		httpstopc: make(chan struct{}),
 		httpdonec: make(chan struct{}),
@@ -219,6 +222,7 @@ func (rc *raftNode) startRaft() {
 
 // Stop closes raft http service, closes all channels, and stops raft instance.
 func (rc *raftNode) stop() {
+	rc.logger.Info("raft instance stop service", zap.Int("member", rc.id))
 	// stop raft http service
 	rc.transport.Stop()
 	close(rc.httpstopc)
@@ -299,12 +303,17 @@ func (rc *raftNode) serveChannels() {
 	defer rc.wal.Close()
 
 	ticker := time.NewTicker(time.Duration(rc.latency) * time.Millisecond)
+	rc.logger.Info("raft instance start service", zap.Int("member", rc.id))
 	defer ticker.Stop()
 
 	// event loop on raft state machine updates
 	for {
 		select {
 		case <-ticker.C:
+			if rc.leadkill && rc.node.IsLeader() {
+				rc.stop()
+				return
+			}
 			rc.node.Tick()
 		case msgs, ok := <-rc.outQueueC:
 			if !ok {

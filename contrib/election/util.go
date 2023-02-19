@@ -126,8 +126,6 @@ func (mn *mockNet) serveChannels() {
 			}
 			mn.pkgtotal++
 		case <-mn.stopc:
-			mn.logger.Sugar().Infof("total packet %d, loss %d", mn.pkgtotal, mn.pkglost)
-			mn.logger.Sugar().Infof("average latency per packet %d", mn.reallatency/mn.pkgtotal)
 			close(mn.outQueueC)
 			return
 		}
