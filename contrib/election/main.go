@@ -47,7 +47,7 @@ func main() {
 	flag.Parse()
 
 	// configure the zap logger
-	path := filepath.Join(*basedir, *desc, time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf("%d", *id))
+	path := filepath.Join(*basedir, *desc, time.Now().Format("2006-01-02-15-04"), fmt.Sprintf("%d", *id))
 	if err := os.MkdirAll(path, os.ModePerm); err != nil {
 		panic(fmt.Sprintf("fail to create result path (%s), error (%v)", path, err))
 	}
@@ -58,23 +58,25 @@ func main() {
 	var outQueueC <-chan []raftpb.Message
 	stopc := make(chan struct{})
 	if *mocknet {
-		inQueueC, outQueueC = newMockNet(*msgloss, *msgdelay, stopc, logger)
+		inQueueC, outQueueC = newMockNet(*id, *msgloss, *msgdelay, stopc, logger)
 	}
 	args := &Args{
 		id:        *id,
 		peers:     strings.Split(*cluster, ","),
 		latency:   *latency,
+		leadkill:  *leadkill,
 		inQueueC:  inQueueC,
 		outQueueC: outQueueC,
-		leadkill:  *leadkill,
+		stopc:     stopc,
 	}
-	stopDoneC := newRaftNode(args, logger)
+	stopdonec := newRaftNode(args, logger)
 
 	// wait util experiment timeout and the raftNode stopped
-	if _, ok := <-time.After(*duration * time.Second); ok {
+	select {
+	case <-time.After(*duration * time.Second):
 		close(stopc)
+	case <-stopdonec:
 	}
-	if _, ok := <-stopDoneC; !ok {
-		logger.Info("election instance stopped", zap.Int("member", *id))
-	}
+	<-stopdonec
+	logger.Info("election instance stopped", zap.Int("member", *id))
 }

@@ -41,8 +41,9 @@ type Packet struct {
 }
 
 type mockNet struct {
+	id          int
 	msgloss     int
-	latency     int
+	msgdelay    int
 	maxsize     uint64
 	timetick    uint64
 	pkglost     uint64
@@ -57,13 +58,14 @@ type mockNet struct {
 	logger *zap.Logger
 }
 
-func newMockNet(msgloss, latency int, stopc chan struct{}, logger *zap.Logger) (chan<- raftpb.Message, <-chan []raftpb.Message) {
+func newMockNet(id, msgloss, msgdelay int, stopc chan struct{}, logger *zap.Logger) (chan<- raftpb.Message, <-chan []raftpb.Message) {
 	var maxsize uint64 = 10000
 	inQueueC := make(chan raftpb.Message, maxsize)
 	outQueueC := make(chan []raftpb.Message, maxsize)
 	mc := &mockNet{
+		id:          id,
 		msgloss:     msgloss,
-		latency:     latency,
+		msgdelay:    msgdelay,
 		maxsize:     maxsize,
 		timetick:    uint64(0),
 		pkglost:     uint64(0),
@@ -82,7 +84,7 @@ func newMockNet(msgloss, latency int, stopc chan struct{}, logger *zap.Logger) (
 func (mn *mockNet) sendPackets(pkts []Packet) {
 	if len(pkts) > 0 {
 		if uint64(len(mn.outQueueC)) > mn.maxsize {
-			mn.logger.Warn("messages exceed the capacity of output channel and block")
+			mn.logger.Warn("messages exceed the capacity of output channel and block", zap.Int("member", mn.id))
 		}
 		msgs := make([]raftpb.Message, 0, len(pkts))
 		for i := range pkts {
@@ -96,7 +98,7 @@ func (mn *mockNet) packetsToSend() (npkts []Packet) {
 	if len(mn.packets) > 0 {
 		var idx int = -1
 		for i := range mn.packets {
-			if mn.packets[i].time+uint64(mn.latency) <= mn.timetick {
+			if mn.packets[i].time+uint64(mn.msgdelay) <= mn.timetick {
 				idx = i
 				mn.reallatency += mn.timetick - mn.packets[i].time
 			}
@@ -126,6 +128,11 @@ func (mn *mockNet) serveChannels() {
 			}
 			mn.pkgtotal++
 		case <-mn.stopc:
+			mn.logger.Info("mock net terminates with packets statistics",
+				zap.Int("member", mn.id),
+				zap.Uint64("pkgtot", mn.pkgtotal),
+				zap.Uint64("pkglost", mn.pkglost),
+				zap.Uint64("latencyavg", mn.reallatency/mn.pkgtotal))
 			close(mn.outQueueC)
 			return
 		}
