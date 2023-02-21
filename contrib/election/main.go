@@ -28,23 +28,26 @@ import (
 )
 
 func main() {
-	// user input parameters to configure the election experiment
-	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
-	id := flag.Int("id", 1, "member index in the cluster peers")
-	duration := flag.Duration("duration", 60, "alive duration of the raft instance in seconds")
-	latency := flag.Int("latency", 0, "average latency of the real network condition")
-	resdir := flag.String("resdir", "results/", "the directory to output experiment logs")
-	mocknet := flag.Bool("mocknet", false, "whether to use mock network module to simulate message latency and loss")
-	msgloss := flag.Int("msgloss", 0, "ratio to trigger message loss in percentage (only works when mocknet is true)")
-	msgdelay := flag.Int("msgdelay", 0, "additional latency for message transmission (only works when mocknet is true)")
-	flag.Parse()
-
-	// configure the zap logger
 	root, err := os.Getwd()
 	if err != nil {
 		fmt.Println("fail to get working directory")
 	}
-	path := filepath.Join(root, *resdir, time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf("%d", *id))
+
+	// user input parameters to configure the election experiment
+	basedir := flag.String("basedir", root, "directory to output experiment logs")
+	desc := flag.String("desc", "example", "concise description about the name and configurations of this experiment")
+	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
+	id := flag.Int("id", 1, "member index in the cluster peers")
+	duration := flag.Duration("duration", 60, "alive duration of the raft instance in seconds")
+	latency := flag.Int("latency", 0, "average latency of the real network condition")
+	mocknet := flag.Bool("mocknet", false, "use mock network module to simulate message latency and loss")
+	msgloss := flag.Int("msgloss", 0, "ratio to trigger message loss in percentage (only works when mocknet is true)")
+	msgdelay := flag.Int("msgdelay", 0, "additional latency for message transmission (only works when mocknet is true)")
+	leadkill := flag.Bool("leadkill", false, "kill the leader after the first round of election and observe the time to repair")
+	flag.Parse()
+
+	// configure the zap logger
+	path := filepath.Join(*basedir, *desc, time.Now().Format("2006-01-02-15-04"), fmt.Sprintf("%d", *id))
 	if err := os.MkdirAll(path, os.ModePerm); err != nil {
 		panic(fmt.Sprintf("fail to create result path (%s), error (%v)", path, err))
 	}
@@ -55,22 +58,25 @@ func main() {
 	var outQueueC <-chan []raftpb.Message
 	stopc := make(chan struct{})
 	if *mocknet {
-		inQueueC, outQueueC = newMockNet(*msgloss, *msgdelay, stopc, logger)
+		inQueueC, outQueueC = newMockNet(*id, *msgloss, *msgdelay, stopc, logger)
 	}
 	args := &Args{
 		id:        *id,
 		peers:     strings.Split(*cluster, ","),
 		latency:   *latency,
+		leadkill:  *leadkill,
 		inQueueC:  inQueueC,
 		outQueueC: outQueueC,
+		stopc:     stopc,
 	}
-	stopDoneC := newRaftNode(args, logger)
+	stopdonec := newRaftNode(args, logger)
 
 	// wait util experiment timeout and the raftNode stopped
-	if _, ok := <-time.After(*duration * time.Second); ok {
+	select {
+	case <-time.After(*duration * time.Second):
 		close(stopc)
+	case <-stopdonec:
 	}
-	if _, ok := <-stopDoneC; !ok {
-		logger.Info("election instance stopped", zap.Int("member", *id))
-	}
+	<-stopdonec
+	logger.Info("election instance stopped", zap.Int("member", *id))
 }

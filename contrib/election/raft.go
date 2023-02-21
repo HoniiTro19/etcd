@@ -30,9 +30,9 @@ import (
 	stats "go.etcd.io/etcd/server/v3/etcdserver/api/v2stats"
 	"go.etcd.io/etcd/server/v3/storage/wal"
 	"go.etcd.io/etcd/server/v3/storage/wal/walpb"
+
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
-
 	"go.uber.org/zap"
 )
 
@@ -40,8 +40,10 @@ type Args struct {
 	id        int
 	peers     []string
 	latency   int
+	leadkill  bool
 	inQueueC  chan<- raftpb.Message
 	outQueueC <-chan []raftpb.Message
+	stopc     chan struct{}
 }
 
 // A usage example of raft instance(raft.Node) without proposals, reads or confchanges from outside.
@@ -53,6 +55,7 @@ type raftNode struct {
 	wal         *wal.WAL
 	snapdir     string
 	snapshotter *snap.Snapshotter
+	leadkill    bool
 
 	confState     raftpb.ConfState
 	snapshotIndex uint64
@@ -69,7 +72,11 @@ type raftNode struct {
 	httpdonec chan struct{}           // signals http server shutdown complete
 	inQueueC  chan<- raftpb.Message   // pass messages sent by raft instance into the mock network
 	outQueueC <-chan []raftpb.Message // get messages from the mock network
+	stopc     chan struct{}           // get the experiment timeout signal
 
+	// statistics results
+	msgin  uint64
+	msgout uint64
 	logger *zap.Logger
 }
 
@@ -87,11 +94,13 @@ func newRaftNode(args *Args, logger *zap.Logger) chan struct{} {
 		latency:   args.latency,
 		waldir:    fmt.Sprintf("election-%d", args.id),
 		snapdir:   fmt.Sprintf("election-%d-snap", args.id),
+		leadkill:  args.leadkill,
 		stopdonec: stopdonec,
 		httpstopc: make(chan struct{}),
 		httpdonec: make(chan struct{}),
 		inQueueC:  args.inQueueC,
 		outQueueC: args.outQueueC,
+		stopc:     args.stopc,
 		logger:    logger,
 		// rest of structure populated after wal replay
 	}
@@ -219,6 +228,10 @@ func (rc *raftNode) startRaft() {
 
 // Stop closes raft http service, closes all channels, and stops raft instance.
 func (rc *raftNode) stop() {
+	rc.logger.Info("raft instance stop service",
+		zap.Int("member", rc.id),
+		zap.Uint64("msgin", rc.msgin),
+		zap.Uint64("msgout", rc.msgout))
 	// stop raft http service
 	rc.transport.Stop()
 	close(rc.httpstopc)
@@ -226,8 +239,26 @@ func (rc *raftNode) stop() {
 
 	// stop raft instance
 	rc.node.Stop()
-	close(rc.inQueueC)
+	if rc.inQueueC != nil {
+		close(rc.inQueueC)
+	}
+
+	// clean up the wal and snapshot directory
+	rc.cleanWalSnap()
 	close(rc.stopdonec)
+}
+
+// Clear the wal and snapshot directory
+func (rc *raftNode) cleanWalSnap() {
+	rc.wal.Close()
+	if rmErr := os.RemoveAll(rc.waldir); rmErr != nil {
+		rc.logger.Warn("fail to clean up wal directory", zap.Int("member", rc.id), zap.Error(rmErr))
+	}
+	rc.logger.Info("clean up wal", zap.Int("member", rc.id), zap.String("wal", rc.waldir))
+	if rmErr := os.RemoveAll(rc.snapdir); rmErr != nil {
+		rc.logger.Warn("fail to clean up snapshot directory", zap.Int("member", rc.id), zap.Error(rmErr))
+	}
+	rc.logger.Info("clean up snapshot", zap.Int("member", rc.id), zap.String("snap", rc.snapdir))
 }
 
 // Find the entries that have not been appied in this raftNode
@@ -259,7 +290,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 			if len(ents[i].Data) == 0 {
 				rc.logger.Info("receive empty entry", zap.Int("member", rc.id))
 			} else {
-				rc.logger.Error("receive non-empty entry",
+				rc.logger.Warn("receive non-empty entry",
 					zap.Int("member", rc.id),
 					zap.ByteString("data", ents[i].Data))
 			}
@@ -296,15 +327,18 @@ func (rc *raftNode) serveChannels() {
 	rc.snapshotIndex = snap.Metadata.Index
 	rc.appliedIndex = snap.Metadata.Index
 
-	defer rc.wal.Close()
-
 	ticker := time.NewTicker(time.Duration(rc.latency) * time.Millisecond)
+	rc.logger.Info("raft instance start service", zap.Int("member", rc.id))
 	defer ticker.Stop()
 
 	// event loop on raft state machine updates
 	for {
 		select {
 		case <-ticker.C:
+			if rc.leadkill && rc.node.IsLeader() {
+				rc.stop()
+				return
+			}
 			rc.node.Tick()
 		case msgs, ok := <-rc.outQueueC:
 			if !ok {
@@ -314,7 +348,7 @@ func (rc *raftNode) serveChannels() {
 			rc.transport.Send(rc.processMessages(msgs))
 		case rd := <-rc.node.Ready():
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				rc.logger.Error("ignore snapshot from raft instance ready channel",
+				rc.logger.Warn("ignore snapshot from raft instance ready channel",
 					zap.Int("member", rc.id),
 					zap.Uint64("index", rd.Snapshot.Metadata.Index),
 					zap.Uint64("term", rd.Snapshot.Metadata.Term),
@@ -330,6 +364,9 @@ func (rc *raftNode) serveChannels() {
 			rc.node.Advance()
 		case err := <-rc.transport.ErrorC:
 			rc.logger.Fatal("get transport error", zap.Int("member", rc.id), zap.Error(err))
+			rc.stop()
+			return
+		case <-rc.stopc:
 			rc.stop()
 			return
 		}
@@ -351,6 +388,7 @@ func (rc *raftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 // Choose to use mock network to simulate message loss and delay
 // or directly send messages to other peers
 func (rc *raftNode) sendMessages(msgs []raftpb.Message) {
+	rc.msgout += uint64(len(msgs))
 	if rc.inQueueC == nil {
 		// mock network is set to false in the configuration
 		rc.transport.Send(rc.processMessages(msgs))
@@ -386,6 +424,7 @@ func (rc *raftNode) serveRaft() {
 
 // implement the raft interface in transport.go
 func (rc *raftNode) Process(ctx context.Context, m raftpb.Message) error {
+	rc.msgin += 1
 	return rc.node.Step(ctx, m)
 }
 func (rc *raftNode) IsIDRemoved(id uint64) bool  { return false }
