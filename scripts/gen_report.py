@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import argparse
 import json
 import paramiko
@@ -19,14 +20,14 @@ class RemoteServer:
         
     def __iter__(self):
         cmd = 'cat ' + self.path
-        _, self.iterout, stderr = self.server.exec_command(cmd)
-        err = stderr.readlines()
+        _, self.stdout, stderr = self.server.exec_command(cmd)
+        err = stderr.readlines() if stderr else []
         if len(err):
             raise Exception('get stderr when loading file in remote server', err)
         return self
         
     def __next__(self):
-        line = self.iterout.readline()
+        line = self.stdout.readline()
         if line:
             return line
         else:
@@ -43,7 +44,7 @@ class RemoteServer:
         
     def execute_cmd(self, cmd):
         _, stdout, stderr = self.server.exec_command(cmd)
-        err = stderr.readlines()
+        err = stderr.readlines() if stderr else []
         if len(err):
             raise Exception('get stderr when checking directory in remote server', err)
         return stdout.readlines()
@@ -51,7 +52,7 @@ class RemoteServer:
  ################################################### UTILS ################################################
 # For each round of experiment, which has the same log file location in the cluster peers, 
 # we need to count the average time a leader to take over and the cumulative duration when the cluster has no master.
-def gen_elect_result(peers, subdir):
+def gen_elect_result(peers, subdir, leadkill):
     npeers = len(peers)
     # start remote servers to read log files
     rss = [RemoteServer(peers[i], os.path.join(subdir, '{}'.format(i+1), 'election.log')) for i in range(npeers)]
@@ -74,6 +75,8 @@ def gen_elect_result(peers, subdir):
         # jot down the state changes of the raft cluster
         if js['level'] == 'warn':
             warning.append(json.dumps(js))
+        elif js['msg'] == 'mock net terminates with packets statistics':
+            mocknetstat += json.dumps(js) + '\n'
         elif js['msg'] == 'raft instance start service':
             if startts == 0:
                 startts = js['ts']
@@ -96,11 +99,10 @@ def gen_elect_result(peers, subdir):
             else:
                 msg = 'illegal for peer {0} to take over while leader {1} still in lease'.format(idx, leader)
                 raise Exception(msg)
-            if ttr == 0 and stopts > 0:
+            if leadkill and ttr == 0 and stopts > 0:
                 ttr = js['ts'] - stopts
-        elif js['msg'] == 'mock net terminates with packets statistics':
-            mocknetstat += json.dumps(js) + '\n'
-        
+                break
+
         try:
             globaljs[idx] = load_legal_row(rss[idx], globaljs[idx]['ts'])            
         except StopIteration: 
@@ -108,9 +110,8 @@ def gen_elect_result(peers, subdir):
             rss[idx] = None
             globaljs[idx]['ts'] = sys.maxsize
     
-    # noleader += stopts - stepdownts 
-    
-    return noleader / (stopts - startts), takeovercnt, noleader / takeovercnt, ttr, \
+    noleader += stopts - stepdownts
+    return noleader / (stopts - startts), takeovercnt, noleader / takeovercnt if takeovercnt > 0 else 0, ttr, \
             warning, mocknetstat, msgstat
 
 # Generate the statistics results in all sub directories
@@ -136,17 +137,25 @@ def gen_group_elect_results(peers, dir):
         if len(warning) > 0:
             print(path)
             for warn in warning:
-                print('warning: {0}'.format(warn))
+                print('Warn: {0}'.format(warn))
                 
-    return noleadrates, ttrs, mocknetstats, msgstats
+    return noleadrates, ttrs
     
 # Boxplot the no leader ratios and the time to repair after downtime of a group of experiments
-def gen_graph(noleadrates, ttrs, mocknetstats, msgstats):
+def gen_graph(title, noleadrates, ttrs, tags):
+    assert len(noleadrates) == len(ttrs) == len(tags)
     fig, axes = plt.subplots(nrows=1, ncols=2, figsize=(9,4))
-    bplot1 = axes[0].boxplot()
-    bplot2 = axes[1].boxplot()
-    
-################################################### FUNCTIONS ################################################
+    bplot1 = axes[0].boxplot(noleadrates, notch=True, vert=True, patch_artist=True)
+    bplot2 = axes[1].boxplot(ttrs, notch=True, vert=True, patch_artist=True)
+    for ax in axes:
+        ax.yaxis.grid(True)
+        ax.set_xlabel(title)
+    axes[0].set_ylabel('no leader ratio (%)')
+    axes[1].set_ylabel('time to repair (ms)')
+    plt.setp(axes, xticks=[i+1 for i in range(len(tags))], xticklabels=tags)
+    plt.show()
+
+################################################### UTILS ################################################
 # Read the next log file with 'member' tag from given remote server, 
 # and ensure the timestamp satisfies a restriction of linear growth
 def load_legal_row(rs, globalts):
@@ -156,7 +165,8 @@ def load_legal_row(rs, globalts):
     while 'member' not in js:
         js = json.loads(next(rs))
     if js['ts'] < globalts:
-        raise ValueError('timestamp ({0}) fallback in the log row: {1}'.format(globalts, js))
+        print('Warn: timestamp ({0}) fallback in the log row: {1}'.format(globalts, js))
+
     return js
 
 def find_mints_log(npeers, globaljs):
@@ -174,15 +184,27 @@ if __name__ == "__main__":
     # parse arguments, all of which should be passed in by users 
     description = 'generate reports for single or several election experiments'
     parser = argparse.ArgumentParser(description)
-    parser.add_argument('dirs', help='the result directory to generate reports')
-    parser.add_argument('peers', help='the comma-separated and ordered ssh addresses of raft instances')
+    parser.add_argument('title', help='description of this group of experiments')
+    parser.add_argument('dirs', help='result directory to generate reports')
+    parser.add_argument('peers', help='comma-separated and ordered ssh addresses of raft instances')
+    parser.add_argument('leadkill', help='experiments to test the time to repair')
     args = parser.parse_args()
     dirs = args.dirs.split(',')
     peers = args.peers.split(',')
-    
-    for dir in dirs:
-        noleadrates, ttrs, mocknetstats, msgstats = gen_group_elect_results(peers, dir)
-        print(noleadrates)
-        print(ttrs)
-        print(mocknetstats)
-        print(msgstats)
+
+    # generate results
+    if len(dirs) > 1:
+        noleadrates, ttrs, tags = [], [], []
+        pattern = r"\d+\.?\d*"
+        for dir in dirs:
+            noleadrate, ttr = gen_group_elect_results(peers, dir)
+            noleadrates.append(noleadrate)
+            ttrs.append(ttr)
+            res = re.findall(pattern, dir)
+            assert len(res) == 1
+            tags.append(res[0])
+        gen_graph(title, noleadrates, ttrs, tags)
+    else:
+        noleadrate, ttr = gen_group_elect_results(peers, dirs[0])
+        print('no leader ratios: {0}'.format(noleadrate))
+        print('time to repairs: {0}'.format(ttr))
