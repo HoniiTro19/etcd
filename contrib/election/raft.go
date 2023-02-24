@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -37,6 +38,7 @@ import (
 )
 
 type Args struct {
+	round     int
 	id        int
 	peers     []string
 	latency   int
@@ -92,8 +94,8 @@ func newRaftNode(args *Args, logger *zap.Logger) chan struct{} {
 		id:        args.id,
 		peers:     args.peers,
 		latency:   args.latency,
-		waldir:    fmt.Sprintf("election-%d", args.id),
-		snapdir:   fmt.Sprintf("election-%d-snap", args.id),
+		waldir:    filepath.Join("tmp", fmt.Sprintf("%d", args.round), fmt.Sprintf("election-%d", args.id)),
+		snapdir:   filepath.Join("tmp", fmt.Sprintf("%d", args.round), fmt.Sprintf("election-%d-snap", args.id)),
 		leadkill:  args.leadkill,
 		stopdonec: stopdonec,
 		httpstopc: make(chan struct{}),
@@ -127,7 +129,7 @@ func (rc *raftNode) loadSnapshot() *raftpb.Snapshot {
 // openWAL returns a wal ready for reading.
 func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 	if !wal.Exist(rc.waldir) {
-		if err := os.Mkdir(rc.waldir, 0750); err != nil {
+		if err := os.MkdirAll(rc.waldir, 0750); err != nil {
 			rc.logger.Fatal("cannot create dir for wal", zap.Int("member", rc.id), zap.Error(err))
 		}
 		w, err := wal.Create(rc.logger, rc.waldir, nil)
@@ -173,7 +175,7 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 // Restore the state of raft instance and start the raft service.
 func (rc *raftNode) startRaft() {
 	if !fileutil.Exist(rc.snapdir) {
-		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
+		if err := os.MkdirAll(rc.snapdir, 0750); err != nil {
 			rc.logger.Fatal("cannot create dir for snapshot", zap.Int("member", rc.id), zap.Error(err))
 		}
 	}

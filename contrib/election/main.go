@@ -44,10 +44,11 @@ func main() {
 	msgloss := flag.Int("msgloss", 0, "ratio to trigger message loss in percentage (only works when mocknet is true)")
 	msgdelay := flag.Int("msgdelay", 0, "additional latency for message transmission (only works when mocknet is true)")
 	leadkill := flag.Bool("leadkill", false, "kill the leader after the first round of election and observe the time to repair")
+	round := flag.Int("round", 1, "a strictly monotonically increasing and unique sequence number to distinguish logs from different rounds of experiments")
 	flag.Parse()
 
 	// configure the zap logger
-	path := filepath.Join(*basedir, *desc, time.Now().Format("2006-01-02-15-04"), fmt.Sprintf("%d", *id))
+	path := filepath.Join(*basedir, *desc, fmt.Sprintf("%d", *round), fmt.Sprintf("%d", *id))
 	if err := os.MkdirAll(path, os.ModePerm); err != nil {
 		panic(fmt.Sprintf("fail to create result path (%s), error (%v)", path, err))
 	}
@@ -61,6 +62,7 @@ func main() {
 		inQueueC, outQueueC = newMockNet(*id, *msgloss, *msgdelay, stopc, logger)
 	}
 	args := &Args{
+		round:     *round,
 		id:        *id,
 		peers:     strings.Split(*cluster, ","),
 		latency:   *latency,
