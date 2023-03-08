@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-if [ $# -ne 10 ] ; then
-    echo "Usage: $(basename $0) CODE_DIR LOG_DIR PORT LATENCY TIMES DEV PARALLEL FUNC ROUND USE_MOCK_NET" >&2
+if [ $# -ne 11 ] ; then
+    echo "Usage: $(basename $0) CODE_DIR LOG_DIR PORT LATENCY TIMES DEV PARALLEL FUNC ROUND USE_MOCK_NET DURATION" >&2
     exit 2
 fi
 
@@ -21,7 +21,7 @@ start_raft() {
 
 # start_tc_filter(port)
 start_tc_filter() {
-    echo "create tc filter on server ${i} port $1"
+    echo "create tc filter on port $1"
     for i in ${!sshaddrs[@]}; do
         ssh -n -o ConnectTimeout=${TIME_OUT} ${sshaddrs[i]} "
         sudo tc filter add dev ${DEV} protocol ip parent 1:0 prio 4 u32 match ip sport $1 0xffff flowid 1:4 &&
@@ -74,7 +74,7 @@ clean_up_tc() {
     done
 }
 
-# start_msgloss_mttr(round, usemocknet)
+# start_msgloss_mttr(round, usemocknet, duration)
 start_msgloss_mttr() {
     for loss in ${msgloss[@]}; do
         round=$1
@@ -87,8 +87,9 @@ start_msgloss_mttr() {
         for i in $(seq 1 ${TIMES}); do
             for p in $(seq 1 ${PARALLEL}); do
                 flush_parameters $((${PORT}+${p}))
-                start_raft "msgloss${loss}mttr" 200 $2 ${loss} 0 true ${round}
+                start_raft "msgloss${loss}mttr" $3 $2 ${loss} 0 true ${round}
                 round=$((${round}+1))
+                sleep 1s
             done
             wait
         done
@@ -111,7 +112,7 @@ start_msgdelay_mttr() {
         for i in $(seq 1 ${TIMES}); do
             for p in $(seq 1 ${PARALLEL}); do
                 flush_parameters $((${PORT}+${p}))
-                start_raft "msgdelay${delay}mttr" 200 $2 0 ${delay} true ${round}
+                start_raft "msgdelay${delay}mttr" $3 $2 0 ${delay} true ${round}
                 round=$((${round}+1))
             done
             wait
@@ -124,7 +125,7 @@ start_msgdelay_mttr() {
 
 # start_msgloss_noleader(round, usemocknet)
 start_msgloss_noleader() {
-    for loss in ${msgloss[@]}; do
+    for loss in ${msglossnoleader[@]}; do
         round=$1
         if [ $2 == false ]; then
             start_tc_loss ${loss}
@@ -135,7 +136,7 @@ start_msgloss_noleader() {
         for i in $(seq 1 ${TIMES}); do
             for p in $(seq 1 ${PARALLEL}); do
                 flush_parameters $((${PORT}+${p}))
-                start_raft "msgloss${loss}noleader" 1800 $2 ${loss} 0 false ${round}
+                start_raft "msgloss${loss}noleader" $3 $2 ${loss} 0 false ${round}
                 round=$((${round}+1))
             done
             wait
@@ -154,7 +155,7 @@ flush_parameters() {
   CLUSTER=$(IFS=,; echo "${clusters[*]}")
 }
 
-TIME_OUT=2000
+TIME_OUT=20000
 CODE_DIR=$1; shift
 LOG_DIR=$1; shift
 PORT=$1; shift
@@ -164,17 +165,18 @@ TIMES=$1; shift
 DEV=$1; shift
 PARALLEL=$1; shift
 
-msgloss=(0 5 10 15 20 30 40 50)
+msgloss=(40 50)
 msgdelay=(1 100 200 300 400)
+msglossnoleader=(50 60 65 70)
 
 host=(`cat hostname.txt`)
 npeers=`expr ${#host[@]} / 3`
 flush_parameters ${PORT}
 
-if declare -f ${1} > /dev/null
+if declare -f $1 > /dev/null
 then 
     "$@"
 else 
-    echo "Error: ${1} is not a known function name, Options: [start_msgloss_mttr|start_msgdelay_mttr|start_msgloss_noleader]" >&2
+    echo "Error: $1 is not a known function name, Options: [start_msgloss_mttr|start_msgdelay_mttr|start_msgloss_noleader]" >&2
     exit 1
 fi
