@@ -37,6 +37,8 @@ import (
 	"go.uber.org/zap"
 )
 
+const electionTick = 10
+
 type Args struct {
 	round     int
 	id        int
@@ -58,6 +60,7 @@ type raftNode struct {
 	snapdir     string
 	snapshotter *snap.Snapshotter
 	leadkill    bool
+	waitLease int
 
 	confState     raftpb.ConfState
 	snapshotIndex uint64
@@ -97,6 +100,7 @@ func newRaftNode(args *Args, logger *zap.Logger) chan struct{} {
 		waldir:    filepath.Join("tmp", fmt.Sprintf("%d", args.round), fmt.Sprintf("election-%d", args.id)),
 		snapdir:   filepath.Join("tmp", fmt.Sprintf("%d", args.round), fmt.Sprintf("election-%d-snap", args.id)),
 		leadkill:  args.leadkill,
+		waitLease: 1,
 		stopdonec: stopdonec,
 		httpstopc: make(chan struct{}),
 		httpdonec: make(chan struct{}),
@@ -194,7 +198,7 @@ func (rc *raftNode) startRaft() {
 	// It is recommended that the election timeout range is 10-20 times of the one-way network latency.
 	c := &raft.Config{
 		ID:                        uint64(rc.id),
-		ElectionTick:              10,
+		ElectionTick:              electionTick,
 		HeartbeatTick:             1,
 		Storage:                   rc.raftStorage,
 		MaxSizePerMsg:             1024 * 1024,
@@ -338,8 +342,12 @@ func (rc *raftNode) serveChannels() {
 		select {
 		case <-ticker.C:
 			if rc.leadkill && rc.node.IsLeader() {
-				rc.stop()
-				return
+			    if rc.waitLease > electionTick / 2 {
+			        rc.stop()
+                    return
+			    } else {
+			        rc.waitLease += 1
+			    }
 			}
 			rc.node.Tick()
 		case msgs, ok := <-rc.outQueueC:
